@@ -1,0 +1,28 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('payments', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('bill_id')->constrained('bills')->cascadeOnDelete();
+            $table->foreignId('customer_id')->constrained('customers')->cascadeOnDelete();
+            $table->foreignId('collected_by')->constrained('users')->cascadeOnDelete();
+            $table->decimal('amount_paid', 10, 2);
+            $table->enum('payment_method', ['cash', 'bkash', 'nagad', 'bank'])->default('cash');
+            $table->timestamp('payment_date');
+            $table->string('receipt_no')->unique();
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('payments');
+    }
+};
