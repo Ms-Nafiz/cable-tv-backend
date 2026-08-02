@@ -49,6 +49,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/collector/customers', [PaymentController::class, 'collectorCustomers']);
     Route::post('/payments', [PaymentController::class, 'store']);
     Route::get('/payments', [PaymentController::class, 'index']);
+    Route::put('/payments/{payment}', [PaymentController::class, 'update']);
+    Route::delete('/payments/{payment}', [PaymentController::class, 'destroy']);
     Route::get('/receipts/{id}', [PaymentController::class, 'receipt']);
 
     // Areas Routes

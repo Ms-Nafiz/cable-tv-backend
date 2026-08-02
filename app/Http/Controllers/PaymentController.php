@@ -486,4 +486,74 @@ class PaymentController extends Controller
             'Cache-Control' => 'max-age=0',
         ]);
     }
+
+    public function update(Request $request, Payment $payment)
+    {
+        if (!$request->user()->hasRole('super_admin')) {
+            return response()->json(['message' => 'Unauthorized. Only Super Admin can edit payment collections.'], 403);
+        }
+
+        $request->validate([
+            'amount_paid'    => 'required|numeric|min:0.01',
+            'payment_method' => 'required|in:cash,bkash,nagad,bank',
+            'payment_date'   => 'nullable|date',
+            'notes'          => 'nullable|string|max:500',
+        ]);
+
+        DB::transaction(function () use ($request, $payment) {
+            $payment->update([
+                'amount_paid'    => $request->amount_paid,
+                'payment_method' => $request->payment_method,
+                'payment_date'   => $request->payment_date ? Carbon::parse($request->payment_date) : $payment->payment_date,
+                'notes'          => $request->notes,
+            ]);
+
+            if ($payment->bill_id) {
+                $bill = Bill::find($payment->bill_id);
+                if ($bill) {
+                    $totalPaid = Payment::where('bill_id', $bill->id)->sum('amount_paid');
+                    if ($totalPaid >= (float) $bill->amount) {
+                        $bill->update(['status' => 'paid']);
+                    } elseif ($totalPaid > 0) {
+                        $bill->update(['status' => 'partial']);
+                    } else {
+                        $bill->update(['status' => 'unpaid']);
+                    }
+                }
+            }
+        });
+
+        return response()->json([
+            'message' => 'Payment collection updated successfully!',
+            'payment' => $payment->fresh(['customer', 'bill', 'collector']),
+        ]);
+    }
+
+    public function destroy(Request $request, Payment $payment)
+    {
+        if (!$request->user()->hasRole('super_admin')) {
+            return response()->json(['message' => 'Unauthorized. Only Super Admin can delete payment collections.'], 403);
+        }
+
+        DB::transaction(function () use ($payment) {
+            $billId = $payment->bill_id;
+            $payment->delete();
+
+            if ($billId) {
+                $bill = Bill::find($billId);
+                if ($bill) {
+                    $totalPaid = Payment::where('bill_id', $bill->id)->sum('amount_paid');
+                    if ($totalPaid >= (float) $bill->amount) {
+                        $bill->update(['status' => 'paid']);
+                    } elseif ($totalPaid > 0) {
+                        $bill->update(['status' => 'partial']);
+                    } else {
+                        $bill->update(['status' => 'unpaid']);
+                    }
+                }
+            }
+        });
+
+        return response()->json(['message' => 'Payment collection deleted successfully!']);
+    }
 }
