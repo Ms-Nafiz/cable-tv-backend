@@ -345,4 +345,42 @@ class BillController extends Controller
             'Cache-Control' => 'max-age=0',
         ]);
     }
+
+    public function update(Request $request, Bill $bill)
+    {
+        if (!$request->user()->hasRole(['super_admin', 'accounts'])) {
+            return response()->json(['message' => 'Unauthorized. Only Super Admin and Accounts can edit bills.'], 403);
+        }
+
+        $request->validate([
+            'amount'   => 'required|numeric|min:0',
+            'due_date' => 'required|date',
+            'status'   => 'required|in:unpaid,partial,paid',
+        ]);
+
+        $bill->update([
+            'amount'   => $request->amount,
+            'due_date' => $request->due_date,
+            'status'   => $request->status,
+        ]);
+
+        return response()->json([
+            'message' => 'Bill updated successfully!',
+            'bill'    => $bill->fresh(['customer.area', 'payments']),
+        ]);
+    }
+
+    public function destroy(Request $request, Bill $bill)
+    {
+        if (!$request->user()->hasRole('super_admin')) {
+            return response()->json(['message' => 'Unauthorized. Only Super Admin can delete bills.'], 403);
+        }
+
+        DB::transaction(function () use ($bill) {
+            $bill->payments()->delete();
+            $bill->delete();
+        });
+
+        return response()->json(['message' => 'Bill deleted successfully!']);
+    }
 }

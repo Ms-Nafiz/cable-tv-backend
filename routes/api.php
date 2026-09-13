@@ -40,6 +40,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/bills/generate', [BillController::class, 'generate']);
     Route::get('/bills/export-excel', [BillController::class, 'exportExcel']);
     Route::get('/bills', [BillController::class, 'index']);
+    Route::put('/bills/{bill}', [BillController::class, 'update']);
+    Route::delete('/bills/{bill}', [BillController::class, 'destroy']);
     Route::get('/customers/{customer}/bills', [BillController::class, 'customerBills']);
 
     // Collection & Payment Routes
