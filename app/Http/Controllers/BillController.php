@@ -70,7 +70,8 @@ class BillController extends Controller
                 ->orderBy('bill_month', 'asc')
                 ->get();
 
-            $previousDues = (float) $previousUnpaidBills->sum('due_amount');
+            $calculatedPreviousDues = (float) $previousUnpaidBills->sum('due_amount');
+            $previousDues = $bill->previous_dues !== null ? (float) $bill->previous_dues : $calculatedPreviousDues;
 
             // Overdue month names e.g. ["May 2026", "June 2026"]
             $previousDueMonths = $previousUnpaidBills->map(function ($b) {
@@ -361,7 +362,7 @@ class BillController extends Controller
 
         $bill->update([
             'amount'        => $request->amount,
-            'previous_dues' => $request->input('previous_dues', 0),
+            'previous_dues' => $request->has('previous_dues') && $request->previous_dues !== '' ? $request->previous_dues : 0,
             'due_date'      => $request->due_date,
             'status'        => $request->status,
         ]);

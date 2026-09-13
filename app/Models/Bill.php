@@ -13,6 +13,7 @@ class Bill extends Model
         'customer_id',
         'bill_month',
         'amount',
+        'previous_dues',
         'due_date',
         'status',
         'generated_at',
@@ -20,6 +21,7 @@ class Bill extends Model
 
     protected $casts = [
         'amount' => 'decimal:2',
+        'previous_dues' => 'decimal:2',
         'due_date' => 'date',
         'generated_at' => 'datetime',
     ];
