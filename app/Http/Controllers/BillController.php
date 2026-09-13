@@ -353,15 +353,17 @@ class BillController extends Controller
         }
 
         $request->validate([
-            'amount'   => 'required|numeric|min:0',
-            'due_date' => 'required|date',
-            'status'   => 'required|in:unpaid,partial,paid',
+            'amount'        => 'required|numeric|min:0',
+            'previous_dues' => 'nullable|numeric|min:0',
+            'due_date'      => 'required|date',
+            'status'        => 'required|in:unpaid,partial,paid',
         ]);
 
         $bill->update([
-            'amount'   => $request->amount,
-            'due_date' => $request->due_date,
-            'status'   => $request->status,
+            'amount'        => $request->amount,
+            'previous_dues' => $request->input('previous_dues', 0),
+            'due_date'      => $request->due_date,
+            'status'        => $request->status,
         ]);
 
         return response()->json([
