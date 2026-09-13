@@ -61,9 +61,10 @@ class Customer extends Model
 
     public function getTotalDueAttribute()
     {
-        $totalBilled = $this->bills()->sum('amount');
-        $totalPaid = $this->payments()->sum('amount_paid');
-        $grossDue = max(0, $totalBilled - $totalPaid);
+        $totalBilled = (float) $this->bills()->sum('amount');
+        $totalPreviousDues = (float) $this->bills()->sum('previous_dues');
+        $totalPaid = (float) $this->payments()->sum('amount_paid');
+        $grossDue = max(0, ($totalBilled + $totalPreviousDues) - $totalPaid);
         return max(0, $grossDue - (float) $this->advance_balance);
     }
 

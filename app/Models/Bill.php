@@ -45,6 +45,7 @@ class Bill extends Model
 
     public function getDueAmountAttribute()
     {
-        return max(0, (float) $this->amount - $this->paid_amount);
+        $totalBillable = (float) $this->amount + (float) ($this->previous_dues ?? 0);
+        return max(0, $totalBillable - $this->paid_amount);
     }
 }
