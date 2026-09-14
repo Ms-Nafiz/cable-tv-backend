@@ -111,6 +111,10 @@ class BillController extends Controller
 
     public function generate(Request $request)
     {
+        if ($request->filled('customer_id')) {
+            return $this->generateSingle($request);
+        }
+
         $request->validate([
             'bill_month' => 'required|date_format:Y-m',
             'due_date'   => 'required|date',
@@ -202,6 +206,86 @@ class BillController extends Controller
             'skipped_count'          => $skippedCount,
             'advance_adjusted_count' => $advanceAdjustedCount,
         ]);
+    }
+
+    public function generateSingle(Request $request)
+    {
+        $request->validate([
+            'customer_id'   => 'required|exists:customers,id',
+            'bill_month'    => 'required|date_format:Y-m',
+            'due_date'      => 'required|date',
+            'amount'        => 'nullable|numeric|min:0',
+            'previous_dues' => 'nullable|numeric|min:0',
+        ]);
+
+        $customer = Customer::with('area')->findOrFail($request->customer_id);
+
+        // Check if bill already exists for this customer & month
+        $exists = Bill::where('customer_id', $customer->id)
+            ->where('bill_month', $request->bill_month)
+            ->exists();
+
+        if ($exists) {
+            return response()->json([
+                'message' => "A bill for {$customer->name} ({$customer->customer_code}) for {$request->bill_month} already exists!"
+            ], 422);
+        }
+
+        $billMonth = $request->bill_month;
+        $dueDate = $request->due_date;
+        $monthDate = Carbon::parse($billMonth . '-01');
+        $totalDaysInMonth = $monthDate->daysInMonth;
+
+        if ($request->filled('amount') && $request->amount !== null && $request->amount !== '') {
+            $grossAmount = (float) $request->amount;
+        } else {
+            $grossAmount = (float) $customer->monthly_rent;
+            $connDate = Carbon::parse($customer->connection_date);
+
+            // Prorated rule if joined in the same month
+            if ($connDate->format('Y-m') === $billMonth) {
+                $connectionDay = $connDate->day;
+                if ($connectionDay >= 11) {
+                    $activeDays = max(1, $totalDaysInMonth - $connectionDay + 1);
+                    $exactAmount = ($customer->monthly_rent / $totalDaysInMonth) * $activeDays;
+                    $grossAmount = ceil($exactAmount / 5) * 5;
+                }
+            }
+        }
+
+        $advanceAvail = (float) ($customer->advance_balance ?? 0);
+        $appliedAdvance = min($advanceAvail, $grossAmount);
+        $netAmount = max(0, $grossAmount - $appliedAdvance);
+
+        $customPreviousDues = $request->has('previous_dues') && $request->previous_dues !== '' && $request->previous_dues !== null
+            ? (float) $request->previous_dues
+            : null;
+
+        $bill = DB::transaction(function () use ($customer, $billMonth, $netAmount, $appliedAdvance, $dueDate, $customPreviousDues) {
+            $b = Bill::create([
+                'customer_id'   => $customer->id,
+                'bill_month'    => $billMonth,
+                'amount'        => $netAmount,
+                'previous_dues' => $customPreviousDues,
+                'advance'       => $appliedAdvance,
+                'due_date'      => $dueDate,
+                'status'        => $netAmount == 0 ? 'paid' : 'unpaid',
+                'generated_at'  => now(),
+            ]);
+
+            if ($appliedAdvance > 0) {
+                $customer->decrement('advance_balance', $appliedAdvance);
+            }
+
+            \App\Http\Controllers\PaymentController::syncCustomerBillStatuses($customer->id);
+
+            return $b;
+        });
+
+        return response()->json([
+            'message' => "Bill for {$customer->name} ({$billMonth}) generated successfully!",
+            'bill'    => $bill->fresh(['customer.area', 'payments']),
+        ], 201);
     }
 
     public function customerBills(Customer $customer)

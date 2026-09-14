@@ -38,6 +38,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Billing Routes
     Route::post('/bills/generate', [BillController::class, 'generate']);
+    Route::post('/bills/generate-single', [BillController::class, 'generateSingle']);
     Route::get('/bills/export-excel', [BillController::class, 'exportExcel']);
     Route::get('/bills', [BillController::class, 'index']);
     Route::put('/bills/{bill}', [BillController::class, 'update']);
