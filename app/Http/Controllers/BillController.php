@@ -79,8 +79,13 @@ class BillController extends Controller
             })->values()->toArray();
 
             $currentAmount = (float) $bill->amount;
+            $advanceAdjusted = (float) ($bill->advance ?? 0);
             $advanceCredit = (float) ($customer->advance_balance ?? 0);
-            $netPayable = max(0, ($currentAmount + $previousDues) - $advanceCredit);
+            $paidAmount = (float) $bill->paid_amount;
+
+            $totalBillable = $currentAmount + $previousDues;
+            $totalDeductions = $paidAmount + $advanceAdjusted + $advanceCredit;
+            $netPayable = max(0, $totalBillable - $totalDeductions);
 
             $rows[] = [
                 'id'                  => $bill->id,
@@ -89,10 +94,11 @@ class BillController extends Controller
                 'bill_month'          => $bill->bill_month,
                 'due_date'            => $bill->due_date,
                 'amount'              => $currentAmount,
-                'paid_amount'         => (float) $bill->paid_amount,
+                'paid_amount'         => $paidAmount,
                 'due_amount'          => (float) $bill->due_amount,
                 'previous_dues'       => $previousDues,
                 'previous_due_months' => $previousDueMonths,
+                'advance'             => $advanceAdjusted,
                 'advance_credit'      => $advanceCredit,
                 'net_total_payable'   => $netPayable,
                 'status'              => $bill->status,
@@ -140,7 +146,7 @@ class BillController extends Controller
                 }
 
                 $connDate = Carbon::parse($customer->connection_date);
-                $amount = $customer->monthly_rent;
+                $grossAmount = (float) $customer->monthly_rent;
 
                 // Business Rules for Connection Date in the Same Month:
                 // 1. Connection Day 1-10: Full Bill
@@ -157,51 +163,34 @@ class BillController extends Controller
                         // Day 11 to 20: Prorated bill
                         $activeDays = max(1, $totalDaysInMonth - $connectionDay + 1);
                         $exactAmount = ($customer->monthly_rent / $totalDaysInMonth) * $activeDays;
-                        $amount = ceil($exactAmount / 5) * 5;
+                        $grossAmount = ceil($exactAmount / 5) * 5;
                     } else {
                         // Day 1 to 10: Full bill
-                        $amount = $customer->monthly_rent;
+                        $grossAmount = (float) $customer->monthly_rent;
                     }
                 }
+
+                $advanceAvail = (float) ($customer->advance_balance ?? 0);
+                $appliedAdvance = min($advanceAvail, $grossAmount);
+                $netAmount = max(0, $grossAmount - $appliedAdvance);
 
                 $bill = Bill::create([
                     'customer_id'  => $customer->id,
                     'bill_month'   => $billMonth,
-                    'amount'       => $amount,
+                    'amount'       => $netAmount,
+                    'advance'      => $appliedAdvance,
                     'due_date'     => $dueDate,
-                    'status'       => 'unpaid',
+                    'status'       => $netAmount == 0 ? 'paid' : 'unpaid',
                     'generated_at' => now(),
                 ]);
 
-                // Auto-adjust from Advance Credit Balance if customer has advance funds!
-                if ($customer->advance_balance > 0) {
-                    $advanceAvail = (float) $customer->advance_balance;
-                    $applyAmount = min($advanceAvail, (float) $amount);
-
-                    $datePrefix = 'RCPT-ADV-' . date('Ymd') . '-';
-                    $countToday = Payment::where('receipt_no', 'like', $datePrefix . '%')->count();
-                    $advReceiptNo = $datePrefix . str_pad($countToday + 1, 4, '0', STR_PAD_LEFT);
-
-                    Payment::create([
-                        'bill_id'        => $bill->id,
-                        'customer_id'    => $customer->id,
-                        'collected_by'   => auth()->id() ?? 1,
-                        'amount_paid'    => $applyAmount,
-                        'payment_method' => 'cash',
-                        'payment_date'   => now(),
-                        'receipt_no'     => $advReceiptNo,
-                    ]);
-
-                    $customer->decrement('advance_balance', $applyAmount);
-
-                    if ($applyAmount >= (float) $amount) {
-                        $bill->update(['status' => 'paid']);
-                    } else {
-                        $bill->update(['status' => 'partial']);
-                    }
-
+                if ($appliedAdvance > 0) {
+                    $customer->decrement('advance_balance', $appliedAdvance);
                     $advanceAdjustedCount++;
                 }
+
+                // Sync customer bill statuses
+                \App\Http\Controllers\PaymentController::syncCustomerBillStatuses($customer->id);
 
                 $generatedCount++;
             }
@@ -223,11 +212,14 @@ class BillController extends Controller
 
     public function exportExcel(Request $request)
     {
-        $billMonth = $request->input('bill_month', date('Y-m'));
+        $billMonth = $request->input('bill_month');
+        if (!$billMonth) {
+            $billMonth = Bill::max('bill_month');
+        }
 
         $query = Bill::with(['customer.area', 'payments']);
 
-        if ($request->filled('bill_month')) {
+        if ($billMonth) {
             $query->where('bill_month', $billMonth);
         }
 
@@ -266,8 +258,9 @@ class BillController extends Controller
             'Address',
             'Connection Type',
             'STB Serial',
-            'Current Month Bill (' . $billMonth . ')',
+            'Current Month Bill (' . ($billMonth ?: 'All') . ')',
             'Previous Dues (Tk)',
+            'Paid Amount (Tk)',
             'Advance Credit (Tk)',
             'Total Payable Amount (Tk)',
             'Payment Status',
@@ -277,7 +270,7 @@ class BillController extends Controller
         $sheet->fromArray($headers, null, 'A1');
 
         // Header Styling: Emerald Background with Bold White Text
-        $headerRange = 'A1:N1';
+        $headerRange = 'A1:O1';
         $sheet->getStyle($headerRange)->getFont()->setBold(true)->setColor(new \PhpOffice\PhpSpreadsheet\Style\Color('FFFFFFFF'));
         $sheet->getStyle($headerRange)->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FF059669');
         $sheet->getStyle($headerRange)->getAlignment()->setVertical(Alignment::VERTICAL_CENTER);
@@ -290,17 +283,25 @@ class BillController extends Controller
             $customer = $bill->customer;
             if (!$customer) continue;
 
-            $currentBillAmount = (float) $bill->amount;
-
-            $previousDues = Bill::where('customer_id', $customer->id)
+            $previousUnpaidBills = Bill::where('customer_id', $customer->id)
                 ->where('id', '!=', $bill->id)
                 ->where('bill_month', '<', $bill->bill_month)
                 ->whereIn('status', ['unpaid', 'partial'])
-                ->get()
-                ->sum('due_amount');
+                ->orderBy('bill_month', 'asc')
+                ->get();
 
+            $calculatedPreviousDues = (float) $previousUnpaidBills->sum('due_amount');
+            $previousDues = $bill->previous_dues !== null ? (float) $bill->previous_dues : $calculatedPreviousDues;
+
+            $currentBillAmount = (float) $bill->amount;
+            $advanceAdjusted = (float) ($bill->advance ?? 0);
             $advanceCredit = (float) ($customer->advance_balance ?? 0);
-            $totalPayable = max(0, ($currentBillAmount + $previousDues) - $advanceCredit);
+            $totalAdvance = $advanceAdjusted + $advanceCredit;
+            $paidAmount = (float) $bill->paid_amount;
+
+            $totalBillable = $currentBillAmount + $previousDues;
+            $totalDeductions = $paidAmount + $totalAdvance;
+            $totalPayable = max(0, $totalBillable - $totalDeductions);
 
             $rowData = [
                 $sl++,
@@ -313,25 +314,50 @@ class BillController extends Controller
                 $customer->stb_serial ?? '-',
                 $currentBillAmount,
                 $previousDues,
-                $advanceCredit,
+                $paidAmount,
+                $totalAdvance,
                 $totalPayable,
                 strtoupper($bill->status),
                 ''
             ];
 
-            $sheet->fromArray($rowData, null, 'A' . $rowIdx);
+            $sheet->fromArray($rowData, null, 'A' . $rowIdx, true);
 
             // Format Currency cells
-            $sheet->getStyle('I' . $rowIdx)->getNumberFormat()->setFormatCode('#,##0.00');
-            $sheet->getStyle('J' . $rowIdx)->getNumberFormat()->setFormatCode('#,##0.00');
-            $sheet->getStyle('K' . $rowIdx)->getNumberFormat()->setFormatCode('#,##0.00');
-            $sheet->getStyle('L' . $rowIdx)->getNumberFormat()->setFormatCode('#,##0.00');
+            $sheet->getStyle('I' . $rowIdx . ':M' . $rowIdx)->getNumberFormat()->setFormatCode('#,##0.00');
 
             $rowIdx++;
         }
 
+        // Summary Total Row
+        if ($rowIdx > 2) {
+            $summaryRow = [
+                '',
+                'TOTAL',
+                '',
+                '',
+                '',
+                '',
+                '',
+                '',
+                '=SUM(I2:I' . ($rowIdx - 1) . ')',
+                '=SUM(J2:J' . ($rowIdx - 1) . ')',
+                '=SUM(K2:K' . ($rowIdx - 1) . ')',
+                '=SUM(L2:L' . ($rowIdx - 1) . ')',
+                '=SUM(M2:M' . ($rowIdx - 1) . ')',
+                '',
+                ''
+            ];
+            $sheet->fromArray($summaryRow, null, 'A' . $rowIdx);
+            $summaryRange = 'A' . $rowIdx . ':O' . $rowIdx;
+            $sheet->getStyle($summaryRange)->getFont()->setBold(true);
+            $sheet->getStyle($summaryRange)->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FFF1F5F9');
+            $sheet->getStyle('I' . $rowIdx . ':M' . $rowIdx)->getNumberFormat()->setFormatCode('#,##0.00');
+            $sheet->getRowDimension($rowIdx)->setRowHeight(24);
+        }
+
         // Auto-fit column widths
-        foreach (range('A', 'N') as $col) {
+        foreach (range('A', 'O') as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
         }
 

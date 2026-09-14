@@ -16,13 +16,74 @@ use PhpOffice\PhpSpreadsheet\Style\Fill;
 
 class PaymentController extends Controller
 {
+    public static function generateReceiptNo()
+    {
+        $lastPayment = Payment::whereRaw("receipt_no REGEXP '^[0-9]{8}$'")
+            ->orderBy('id', 'desc')
+            ->first();
+
+        if ($lastPayment && is_numeric($lastPayment->receipt_no) && strlen($lastPayment->receipt_no) === 8) {
+            $next = (int) $lastPayment->receipt_no + 1;
+        } else {
+            $next = 10000001;
+        }
+
+        while (Payment::where('receipt_no', (string) $next)->exists()) {
+            $next++;
+        }
+
+        return (string) $next;
+    }
+
+    public static function syncCustomerBillStatuses($customerId)
+    {
+        $customer = Customer::find($customerId);
+        if (!$customer) return;
+
+        $bills = Bill::where('customer_id', $customerId)
+            ->orderBy('bill_month', 'asc')
+            ->orderBy('id', 'asc')
+            ->get();
+
+        $totalPayments = (float) Payment::where('customer_id', $customerId)->sum('amount_paid');
+        $totalGrossBills = (float) $bills->sum('amount');
+
+        // Always sync customer advance credit balance accurately based on gross bills
+        $newAdvanceBalance = max(0, $totalPayments - $totalGrossBills);
+        $customer->update(['advance_balance' => $newAdvanceBalance]);
+
+        if ($bills->isEmpty()) return;
+
+        // Calculate direct payments available after covering gross amounts of prior fully-paid bills
+        $rem = $totalPayments;
+
+        foreach ($bills as $bill) {
+            $grossAmount = (float) $bill->amount;
+            $advanceApplied = (float) ($bill->advance ?? 0);
+            $netRequired = max(0, $grossAmount - $advanceApplied);
+
+            if ($netRequired <= 0) {
+                $bill->update(['status' => 'paid']);
+                $rem = max(0, $rem - $grossAmount);
+                continue;
+            }
+
+            $paidForBill = min($rem, $grossAmount);
+            $rem = max(0, $rem - $paidForBill);
+
+            if (($paidForBill + $advanceApplied) >= $grossAmount) {
+                $bill->update(['status' => 'paid']);
+            } elseif (($paidForBill + $advanceApplied) > 0) {
+                $bill->update(['status' => 'partial']);
+            } else {
+                $bill->update(['status' => 'unpaid']);
+            }
+        }
+    }
+
     public function collectorCustomers(Request $request)
     {
-        $user = $request->user();
-        
-        $query = Customer::with(['area', 'bills' => function ($q) {
-            $q->with('payments')->whereIn('status', ['unpaid', 'partial'])->orderBy('bill_month', 'asc');
-        }]);
+        $query = Customer::with(['area']);
 
         if ($request->filled('search')) {
             $search = $request->search;
@@ -35,7 +96,36 @@ class PaymentController extends Controller
 
         $customers = $query->get();
 
-        return response()->json($customers);
+        foreach ($customers as $customer) {
+            self::syncCustomerBillStatuses($customer->id);
+        }
+
+        $customerIds = $customers->pluck('id');
+        $result = Customer::with(['area', 'bills' => function ($q) {
+            $q->whereIn('status', ['unpaid', 'partial'])->orderBy('bill_month', 'asc');
+        }])->whereIn('id', $customerIds)->get();
+
+        foreach ($result as $customer) {
+            $allBills = Bill::where('customer_id', $customer->id)->orderBy('bill_month', 'asc')->orderBy('id', 'asc')->get();
+            $customer->total_bills_count = $allBills->count();
+            $totalPaidPool = (float) Payment::where('customer_id', $customer->id)->sum('amount_paid');
+            
+            $billDuesMap = [];
+            $remPaid = $totalPaidPool;
+            foreach ($allBills as $b) {
+                $bAmt = (float) $b->amount;
+                $paidForThis = min($remPaid, $bAmt);
+                $remPaid -= $paidForThis;
+                $dueForThis = max(0, $bAmt - $paidForThis);
+                $billDuesMap[$b->id] = $dueForThis;
+            }
+
+            foreach ($customer->bills as $b) {
+                $b->calculated_due = $billDuesMap[$b->id] ?? (float) $b->amount;
+            }
+        }
+
+        return response()->json($result);
     }
 
     public function store(Request $request)
@@ -55,129 +145,93 @@ class PaymentController extends Controller
                 $billIds = [$request->bill_id];
             }
 
+            $customerId = $request->customer_id;
+            if (!$customerId && !empty($billIds)) {
+                $firstBill = Bill::find($billIds[0]);
+                $customerId = $firstBill ? $firstBill->customer_id : null;
+            }
+
+            if (!$customerId) {
+                return response()->json(['message' => 'Customer ID is required.'], 422);
+            }
+
+            $customer = Customer::findOrFail($customerId);
+
+            $hasGeneratedBills = Bill::where('customer_id', $customerId)->exists();
+            if (!$hasGeneratedBills) {
+                return response()->json([
+                    'message' => 'Payment collection is not allowed because no bill has been generated yet for this customer.'
+                ], 422);
+            }
+
             $paymentDate = $request->filled('payment_date') ? Carbon::parse($request->payment_date) : now();
 
-            // Generate single Receipt Number: RCPT-YYYYMMDD-XXXX
-            $datePrefix = 'RCPT-' . date('Ymd') . '-';
-            $lastPaymentToday = Payment::where('receipt_no', 'like', $datePrefix . '%')->count();
-            $receiptNo = $datePrefix . str_pad($lastPaymentToday + 1, 4, '0', STR_PAD_LEFT);
+            // Generate single 8-digit Unique Receipt Number (e.g. 10000001)
+            $receiptNo = self::generateReceiptNo();
 
-            // Handle Direct Advance Credit Payment if no unpaid bills exist
-            if (empty($billIds)) {
-                if (!$request->filled('customer_id')) {
-                    return response()->json(['message' => 'Please select a customer or bill to collect.'], 422);
-                }
+            $amountPaid = (float) $request->amount_paid;
 
-                $customer = Customer::findOrFail($request->customer_id);
-                $advanceAmount = (float) $request->amount_paid;
+            // Calculate customer total gross bills (net amount + advance) and previous total payments BEFORE this payment
+            $totalGrossBills = (float) Bill::where('customer_id', $customerId)->sum(DB::raw('amount + COALESCE(advance, 0)'));
+            $previousPayments = (float) Payment::where('customer_id', $customerId)->sum('amount_paid');
+            $netDuesBeforePayment = max(0, $totalGrossBills - $previousPayments);
 
-                if ($advanceAmount <= 0) {
-                    return response()->json(['message' => 'Please enter a valid advance payment amount.'], 422);
-                }
+            // Advance credit is ONLY added if amount paid exceeds ALL unpaid dues of the customer across all generated bills
+            $advanceAdded = max(0, $amountPaid - $netDuesBeforePayment);
 
-                $payment = Payment::create([
-                    'bill_id'        => null,
-                    'customer_id'    => $customer->id,
-                    'collected_by'   => auth()->id() ?? 1,
-                    'amount_paid'    => $advanceAmount,
-                    'payment_method' => $request->payment_method ?? 'cash',
-                    'payment_date'   => $paymentDate,
-                    'receipt_no'     => $receiptNo,
-                    'notes'          => $request->notes,
-                ]);
+            // Find the LAST bill ID of this customer at the time of payment
+            $lastBill = Bill::where('customer_id', $customerId)
+                ->orderBy('bill_month', 'desc')
+                ->orderBy('id', 'desc')
+                ->first();
 
-                $customer->increment('advance_balance', $advanceAmount);
+            $lastBillId = $lastBill ? $lastBill->id : null;
 
-                $payment->load(['customer.area', 'collector']);
-                $payment->receipt_no = $receiptNo;
-                $payment->total_amount_paid = $advanceAmount;
-                $payment->collected_months = 'Advance Credit Payment';
-                $payment->advance_added = $advanceAmount;
+            // Create ONE unified payment record posted to the LAST bill ID
+            $payment = Payment::create([
+                'bill_id'        => $lastBillId,
+                'customer_id'    => $customerId,
+                'collected_by'   => auth()->id() ?? 1,
+                'amount_paid'    => $amountPaid,
+                'payment_method' => $request->payment_method ?? 'cash',
+                'payment_date'   => $paymentDate,
+                'receipt_no'     => $receiptNo,
+                'notes'          => $request->notes,
+            ]);
 
-                return response()->json($payment, 201);
-            }
+            // Update customer advance_balance accurately
+            $newAdvanceBalance = max(0, ($previousPayments + $amountPaid) - $totalGrossBills);
+            $customer->update(['advance_balance' => $newAdvanceBalance]);
 
-            $bills = Bill::with('customer')->whereIn('id', $billIds)->orderBy('bill_month', 'asc')->get();
-            if ($bills->isEmpty()) {
-                return response()->json(['message' => 'Selected bills not found.'], 404);
-            }
+            // Sync customer bill statuses chronologically
+            self::syncCustomerBillStatuses($customerId);
 
-            $customer = $bills->first()->customer;
-
-            $remainingAmount = (float) $request->amount_paid;
-            $createdPayments = [];
+            // Calculate collected bill months for receipt display
+            $allBills = Bill::where('customer_id', $customerId)->orderBy('bill_month', 'asc')->orderBy('id', 'asc')->get();
+            $remPaidBefore = $previousPayments;
+            $remPaidAfter = $previousPayments + $amountPaid;
             $collectedMonths = [];
 
-            foreach ($bills as $index => $bill) {
-                if ($remainingAmount <= 0) break;
+            foreach ($allBills as $b) {
+                $bAmt = (float) $b->amount;
+                $paidBefore = min($remPaidBefore, $bAmt);
+                $remPaidBefore = max(0, $remPaidBefore - $paidBefore);
 
-                $existingPaid = (float) $bill->payments()->sum('amount_paid');
-                $dueForThisBill = max(0, (float) $bill->amount - $existingPaid);
+                $paidAfter = min($remPaidAfter, $bAmt);
+                $remPaidAfter = max(0, $remPaidAfter - $paidAfter);
 
-                if ($dueForThisBill <= 0) continue;
-
-                $payForThisBill = min($remainingAmount, $dueForThisBill);
-                $remainingAmount -= $payForThisBill;
-
-                $itemReceiptNo = count($bills) > 1
-                    ? $receiptNo . '-' . ($index + 1)
-                    : $receiptNo;
-
-                $payment = Payment::create([
-                    'bill_id'        => $bill->id,
-                    'customer_id'    => $bill->customer_id,
-                    'collected_by'   => auth()->id(),
-                    'amount_paid'    => $payForThisBill,
-                    'payment_method' => $request->payment_method,
-                    'payment_date'   => $paymentDate,
-                    'receipt_no'     => $itemReceiptNo,
-                    'notes'          => $request->notes,
-                ]);
-
-                // Update Bill status
-                $newTotalPaid = $existingPaid + $payForThisBill;
-                if ($newTotalPaid >= (float) $bill->amount) {
-                    $bill->update(['status' => 'paid']);
-                } else {
-                    $bill->update(['status' => 'partial']);
+                if (($paidAfter - $paidBefore) > 0) {
+                    $collectedMonths[] = $b->bill_month;
                 }
-
-                $createdPayments[] = $payment;
-                $collectedMonths[] = $bill->bill_month;
             }
 
-            // If there's surplus payment beyond all selected bills, add to customer advance_balance!
-            $advanceAdded = 0.00;
-            if ($remainingAmount > 0) {
-                $advanceAdded = $remainingAmount;
-                $customer->increment('advance_balance', $remainingAmount);
-            }
+            $payment->load(['customer.area', 'collector', 'bill']);
+            $payment->receipt_no = $receiptNo;
+            $payment->total_amount_paid = $amountPaid;
+            $payment->collected_months = !empty($collectedMonths) ? implode(', ', $collectedMonths) : 'Advance Credit Payment';
+            $payment->advance_added = $advanceAdded;
 
-            $primaryPayment = end($createdPayments);
-            if (!$primaryPayment) {
-                // In case no bills were due but customer paid advance directly
-                $primaryPayment = Payment::create([
-                    'bill_id'        => null,
-                    'customer_id'    => $customer->id,
-                    'collected_by'   => auth()->id(),
-                    'amount_paid'    => $request->amount_paid,
-                    'payment_method' => $request->payment_method,
-                    'payment_date'   => now(),
-                    'receipt_no'     => $receiptNo,
-                ]);
-                $advanceAdded = (float) $request->amount_paid;
-                $customer->increment('advance_balance', $advanceAdded);
-            }
-
-            $primaryPayment->load(['customer.area', 'collector', 'bill']);
-            
-            // Attach unified metadata for receipt
-            $primaryPayment->receipt_no = $receiptNo;
-            $primaryPayment->total_amount_paid = (float) $request->amount_paid;
-            $primaryPayment->collected_months = !empty($collectedMonths) ? implode(', ', $collectedMonths) : 'Advance Credit Payment';
-            $primaryPayment->advance_added = $advanceAdded;
-
-            return response()->json($primaryPayment, 201);
+            return response()->json($payment, 201);
         });
     }
 
@@ -302,62 +356,32 @@ class PaymentController extends Controller
                 $payDate = !empty($payDateRaw) ? Carbon::parse($payDateRaw) : now();
                 $method = in_array($method, ['cash', 'bkash', 'nagad', 'bank']) ? $method : 'cash';
 
-                $unpaidBills = Bill::where('customer_id', $customer->id)
-                    ->whereIn('status', ['unpaid', 'partial'])
-                    ->orderBy('bill_month', 'asc')
-                    ->get();
+                $previousPayments = (float) Payment::where('customer_id', $customer->id)->sum('amount_paid');
+                $totalGrossBills = (float) Bill::where('customer_id', $customer->id)->sum(DB::raw('amount + COALESCE(advance, 0)'));
 
-                $datePrefix = 'RCPT-' . date('Ymd') . '-';
-                $lastCount = Payment::where('receipt_no', 'like', $datePrefix . '%')->count();
-                $receiptNo = $datePrefix . str_pad($lastCount + 1, 4, '0', STR_PAD_LEFT);
+                $receiptNo = self::generateReceiptNo();
 
-                if ($unpaidBills->isEmpty()) {
-                    Payment::create([
-                        'bill_id'        => null,
-                        'customer_id'    => $customer->id,
-                        'collected_by'   => auth()->id() ?? 1,
-                        'amount_paid'    => $amountPaid,
-                        'payment_method' => $method,
-                        'payment_date'   => $payDate,
-                        'receipt_no'     => $receiptNo,
-                        'notes'          => $notes,
-                    ]);
-                    $customer->increment('advance_balance', $amountPaid);
-                } else {
-                    $rem = $amountPaid;
-                    foreach ($unpaidBills as $idx => $bill) {
-                        if ($rem <= 0) break;
-                        $existing = (float) $bill->payments()->sum('amount_paid');
-                        $due = max(0, (float) $bill->amount - $existing);
-                        if ($due <= 0) continue;
+                $lastBill = Bill::where('customer_id', $customer->id)
+                    ->orderBy('bill_month', 'desc')
+                    ->orderBy('id', 'desc')
+                    ->first();
+                $lastBillId = $lastBill ? $lastBill->id : null;
 
-                        $payThis = min($rem, $due);
-                        $rem -= $payThis;
+                Payment::create([
+                    'bill_id'        => $lastBillId,
+                    'customer_id'    => $customer->id,
+                    'collected_by'   => auth()->id() ?? 1,
+                    'amount_paid'    => $amountPaid,
+                    'payment_method' => $method,
+                    'payment_date'   => $payDate,
+                    'receipt_no'     => $receiptNo,
+                    'notes'          => $notes,
+                ]);
 
-                        $itemRcpt = count($unpaidBills) > 1 ? $receiptNo . '-' . ($idx + 1) : $receiptNo;
+                $newAdvanceBalance = max(0, ($previousPayments + $amountPaid) - $totalGrossBills);
+                $customer->update(['advance_balance' => $newAdvanceBalance]);
 
-                        Payment::create([
-                            'bill_id'        => $bill->id,
-                            'customer_id'    => $customer->id,
-                            'collected_by'   => auth()->id() ?? 1,
-                            'amount_paid'    => $payThis,
-                            'payment_method' => $method,
-                            'payment_date'   => $payDate,
-                            'receipt_no'     => $itemRcpt,
-                            'notes'          => $notes,
-                        ]);
-
-                        if (($existing + $payThis) >= (float) $bill->amount) {
-                            $bill->update(['status' => 'paid']);
-                        } else {
-                            $bill->update(['status' => 'partial']);
-                        }
-                    }
-
-                    if ($rem > 0) {
-                        $customer->increment('advance_balance', $rem);
-                    }
-                }
+                self::syncCustomerBillStatuses($customer->id);
 
                 $importedCount++;
             }
@@ -508,19 +532,7 @@ class PaymentController extends Controller
                 'notes'          => $request->notes,
             ]);
 
-            if ($payment->bill_id) {
-                $bill = Bill::find($payment->bill_id);
-                if ($bill) {
-                    $totalPaid = Payment::where('bill_id', $bill->id)->sum('amount_paid');
-                    if ($totalPaid >= (float) $bill->amount) {
-                        $bill->update(['status' => 'paid']);
-                    } elseif ($totalPaid > 0) {
-                        $bill->update(['status' => 'partial']);
-                    } else {
-                        $bill->update(['status' => 'unpaid']);
-                    }
-                }
-            }
+            self::syncCustomerBillStatuses($payment->customer_id);
         });
 
         return response()->json([
@@ -536,22 +548,10 @@ class PaymentController extends Controller
         }
 
         DB::transaction(function () use ($payment) {
-            $billId = $payment->bill_id;
+            $customerId = $payment->customer_id;
             $payment->delete();
 
-            if ($billId) {
-                $bill = Bill::find($billId);
-                if ($bill) {
-                    $totalPaid = Payment::where('bill_id', $bill->id)->sum('amount_paid');
-                    if ($totalPaid >= (float) $bill->amount) {
-                        $bill->update(['status' => 'paid']);
-                    } elseif ($totalPaid > 0) {
-                        $bill->update(['status' => 'partial']);
-                    } else {
-                        $bill->update(['status' => 'unpaid']);
-                    }
-                }
-            }
+            self::syncCustomerBillStatuses($customerId);
         });
 
         return response()->json(['message' => 'Payment collection deleted successfully!']);
