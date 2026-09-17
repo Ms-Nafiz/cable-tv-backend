@@ -19,6 +19,8 @@ class Customer extends Model
         'stb_serial',
         'monthly_rent',
         'deposit_amount',
+        'dues',
+        'advance',
         'advance_balance',
         'connection_date',
         'status',
@@ -28,6 +30,8 @@ class Customer extends Model
     protected $casts = [
         'monthly_rent' => 'decimal:2',
         'deposit_amount' => 'decimal:2',
+        'dues' => 'decimal:2',
+        'advance' => 'decimal:2',
         'advance_balance' => 'decimal:2',
         'connection_date' => 'date',
     ];
@@ -61,11 +65,23 @@ class Customer extends Model
 
     public function getTotalDueAttribute()
     {
-        $totalBilled = (float) $this->bills()->sum('amount');
-        $totalPreviousDues = (float) $this->bills()->sum('previous_dues');
+        $firstBill = $this->bills()->orderBy('bill_month', 'asc')->orderBy('id', 'asc')->first();
+        $openingDues = (float) ($this->dues ?? 0) + ($firstBill ? (float) ($firstBill->previous_dues ?? 0) : 0);
+
+        $bills = $this->bills()->get();
+        $totalBilled = 0;
+        foreach ($bills as $bill) {
+            $amt = (float) $bill->amount;
+            $adj = (float) ($bill->adjustment ?? 0);
+            $adjEffect = $bill->adjustment_type === 'Debit' ? $adj : ($bill->adjustment_type === 'Credit' ? -$adj : 0);
+            $totalBilled += ($amt + $adjEffect);
+        }
+
+        $totalDebits = $openingDues + $totalBilled;
         $totalPaid = (float) $this->payments()->sum('amount_paid');
-        $grossDue = max(0, ($totalBilled + $totalPreviousDues) - $totalPaid);
-        return max(0, $grossDue - (float) $this->advance_balance);
+        $advanceBalance = (float) ($this->advance_balance ?? 0);
+
+        return max(0, $totalDebits - $totalPaid - $advanceBalance);
     }
 
     public function getCurrentDepositAttribute()

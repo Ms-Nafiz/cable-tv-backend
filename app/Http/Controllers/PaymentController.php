@@ -50,28 +50,35 @@ class PaymentController extends Controller
 
         // Always sync customer advance credit balance accurately based on gross bills
         $newAdvanceBalance = max(0, $totalPayments - $totalGrossBills);
-        $customer->update(['advance_balance' => $newAdvanceBalance]);
+        $customer->update([
+            'advance_balance' => $newAdvanceBalance,
+            'advance' => $newAdvanceBalance,
+        ]);
 
         if ($bills->isEmpty()) return;
 
-        // Calculate direct payments available after covering gross amounts of prior fully-paid bills
         $rem = $totalPayments;
 
         foreach ($bills as $bill) {
             $grossAmount = (float) $bill->amount;
+            $dues = (float) ($bill->previous_dues ?? 0);
             $advanceApplied = (float) ($bill->advance ?? 0);
-            $netRequired = max(0, $grossAmount - $advanceApplied);
+            $adj = (float) ($bill->adjustment ?? 0);
+            $adjEffect = $bill->adjustment_type === 'Debit' ? $adj : ($bill->adjustment_type === 'Credit' ? -$adj : 0);
+
+            $billGross = ($grossAmount + $dues) + $adjEffect;
+            $netRequired = max(0, $billGross - $advanceApplied);
 
             if ($netRequired <= 0) {
                 $bill->update(['status' => 'paid']);
-                $rem = max(0, $rem - $grossAmount);
+                $rem = max(0, $rem - $billGross);
                 continue;
             }
 
-            $paidForBill = min($rem, $grossAmount);
+            $paidForBill = min($rem, $netRequired);
             $rem = max(0, $rem - $paidForBill);
 
-            if (($paidForBill + $advanceApplied) >= $grossAmount) {
+            if (($paidForBill + $advanceApplied) >= $billGross) {
                 $bill->update(['status' => 'paid']);
             } elseif (($paidForBill + $advanceApplied) > 0) {
                 $bill->update(['status' => 'partial']);

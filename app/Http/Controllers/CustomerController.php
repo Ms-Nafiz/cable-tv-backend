@@ -61,6 +61,8 @@ class CustomerController extends Controller
             'stb_serial'            => 'nullable|string',
             'monthly_rent'          => 'required|numeric|min:0',
             'deposit_amount'        => 'required|numeric|min:0',
+            'dues'                  => 'nullable|numeric|min:0',
+            'advance'               => 'nullable|numeric|min:0',
             'connection_date'       => 'required|date',
             'assigned_collector_id' => 'nullable|exists:users,id',
         ]);
@@ -69,6 +71,8 @@ class CustomerController extends Controller
             // Generate Code
             $lastId = Customer::max('id') ?? 0;
             $customerCode = 'CCL' . str_pad($lastId + 1, 5, '0', STR_PAD_LEFT);
+
+            $advanceAmount = (float) ($request->advance ?? 0);
 
             $customer = Customer::create([
                 'customer_code'         => $customerCode,
@@ -80,6 +84,9 @@ class CustomerController extends Controller
                 'stb_serial'            => $request->stb_serial,
                 'monthly_rent'          => $request->monthly_rent,
                 'deposit_amount'        => $request->deposit_amount,
+                'dues'                  => (float) ($request->dues ?? 0),
+                'advance'               => $advanceAmount,
+                'advance_balance'       => $advanceAmount,
                 'connection_date'       => $request->connection_date,
                 'status'                => 'active',
                 'assigned_collector_id' => $request->assigned_collector_id,
@@ -126,12 +133,14 @@ class CustomerController extends Controller
             'connection_type'       => 'required|in:analog,digital',
             'stb_serial'            => 'nullable|string',
             'monthly_rent'          => 'required|numeric|min:0',
+            'dues'                  => 'nullable|numeric|min:0',
+            'advance'               => 'nullable|numeric|min:0',
             'connection_date'       => 'required|date',
             'status'                => 'required|in:active,inactive,disconnected',
             'assigned_collector_id' => 'nullable|exists:users,id',
         ]);
 
-        $customer->update([
+        $updateData = [
             'name'                  => $request->name,
             'phone'                 => $request->phone,
             'address'               => $request->address,
@@ -142,7 +151,18 @@ class CustomerController extends Controller
             'connection_date'       => $request->connection_date,
             'status'                => $request->status,
             'assigned_collector_id' => $request->assigned_collector_id,
-        ]);
+        ];
+
+        if ($request->has('dues')) {
+            $updateData['dues'] = (float) $request->dues;
+        }
+
+        if ($request->has('advance')) {
+            $updateData['advance'] = (float) $request->advance;
+            $updateData['advance_balance'] = (float) $request->advance;
+        }
+
+        $customer->update($updateData);
 
         return response()->json($customer->load(['area', 'collector']));
     }
@@ -179,12 +199,13 @@ class CustomerController extends Controller
             'STB Serial',
             'Monthly Rent *',
             'Security Deposit *',
-            'Connection Date (YYYY-MM-DD) *'
+            'Connection Date (YYYY-MM-DD) *',
+            'Opening Dues (optional)'
         ];
 
         $sheet->fromArray($headers, null, 'A1');
 
-        $headerRange = 'A1:I1';
+        $headerRange = 'A1:J1';
         $sheet->getStyle($headerRange)->getFont()->setBold(true)->setColor(new \PhpOffice\PhpSpreadsheet\Style\Color('FFFFFFFF'));
         $sheet->getStyle($headerRange)->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FF059669');
         $sheet->getStyle($headerRange)->getAlignment()->setVertical(Alignment::VERTICAL_CENTER);
@@ -192,13 +213,13 @@ class CustomerController extends Controller
 
         // Sample Rows
         $sampleData = [
-            ['Md. Anowar Hossain', '01711223344', 'House 42, Road 7', 'Dhanmondi Zone', 'analog', '', '500', '500', '2026-05-10'],
-            ['Sharmin Akter', '01899887766', 'Flat 4B, Building 12', 'Gulshan Zone', 'digital', 'STB-998811', '800', '1000', '2026-06-15'],
+            ['Md. Anowar Hossain', '01711223344', 'House 42, Road 7', 'Dhanmondi Zone', 'analog', '', '500', '500', '2026-05-10', '0'],
+            ['Sharmin Akter', '01899887766', 'Flat 4B, Building 12', 'Gulshan Zone', 'digital', 'STB-998811', '800', '1000', '2026-06-15', '200'],
         ];
 
         $sheet->fromArray($sampleData, null, 'A2');
 
-        foreach (range('A', 'I') as $col) {
+        foreach (range('A', 'J') as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
         }
 
@@ -243,6 +264,7 @@ class CustomerController extends Controller
                 $monthlyRent    = (float) ($row['G'] ?? 500);
                 $depositAmount  = (float) ($row['H'] ?? 500);
                 $connDateRaw    = trim($row['I'] ?? '');
+                $openingDues    = (float) ($row['J'] ?? 0);
 
                 if (empty($name) || empty($phone) || empty($areaName)) {
                     $skippedCount++;
@@ -270,6 +292,7 @@ class CustomerController extends Controller
                     'stb_serial'      => !empty($stbSerial) ? $stbSerial : null,
                     'monthly_rent'    => $monthlyRent,
                     'deposit_amount'  => $depositAmount,
+                    'dues'            => $openingDues,
                     'connection_date' => $connDate,
                     'status'          => 'active',
                 ]);

@@ -15,6 +15,8 @@ class Bill extends Model
         'amount',
         'previous_dues',
         'advance',
+        'adjustment',
+        'adjustment_type',
         'due_date',
         'status',
         'generated_at',
@@ -24,6 +26,7 @@ class Bill extends Model
         'amount' => 'decimal:2',
         'previous_dues' => 'decimal:2',
         'advance' => 'decimal:2',
+        'adjustment' => 'decimal:2',
         'due_date' => 'date',
         'generated_at' => 'datetime',
     ];
@@ -47,7 +50,17 @@ class Bill extends Model
 
     public function getDueAmountAttribute()
     {
-        $totalBillable = (float) $this->amount + (float) ($this->previous_dues ?? 0);
+        if ($this->status === 'paid') {
+            return 0.00;
+        }
+
+        $rent = (float) $this->amount;
+        $dues = (float) ($this->previous_dues ?? 0);
+        $advance = (float) ($this->advance ?? 0);
+        $adj = (float) ($this->adjustment ?? 0);
+        $adjEffect = $this->adjustment_type === 'Debit' ? $adj : ($this->adjustment_type === 'Credit' ? -$adj : 0);
+
+        $totalBillable = ($rent + $dues - $advance) + $adjEffect;
         return max(0, $totalBillable - $this->paid_amount);
     }
 }

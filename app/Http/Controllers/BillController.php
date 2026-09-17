@@ -70,7 +70,11 @@ class BillController extends Controller
                 ->orderBy('bill_month', 'asc')
                 ->get();
 
-            $calculatedPreviousDues = (float) $previousUnpaidBills->sum('due_amount');
+            $calculatedPreviousDues = (float) $previousUnpaidBills->sum(function ($pb) {
+                $adj = (float) ($pb->adjustment ?? 0);
+                $adjEffect = $pb->adjustment_type === 'Debit' ? $adj : ($pb->adjustment_type === 'Credit' ? -$adj : 0);
+                return max(0, ((float) $pb->amount + $adjEffect) - (float) $pb->paid_amount);
+            });
             $previousDues = $bill->previous_dues !== null ? (float) $bill->previous_dues : $calculatedPreviousDues;
 
             // Overdue month names e.g. ["May 2026", "June 2026"]
@@ -80,12 +84,15 @@ class BillController extends Controller
 
             $currentAmount = (float) $bill->amount;
             $advanceAdjusted = (float) ($bill->advance ?? 0);
-            $advanceCredit = (float) ($customer->advance_balance ?? 0);
+            $advanceCredit = (float) ($customer->advance_balance ?? $customer->advance ?? 0);
             $paidAmount = (float) $bill->paid_amount;
+            $adjustment = (float) ($bill->adjustment ?? 0);
+            $adjustmentType = $bill->adjustment_type;
 
-            $totalBillable = $currentAmount + $previousDues;
-            $totalDeductions = $paidAmount + $advanceAdjusted + $advanceCredit;
-            $netPayable = max(0, $totalBillable - $totalDeductions);
+            // User formula: (Rent + dues - advance) +/- adjustment
+            $adjEffect = $adjustmentType === 'Debit' ? $adjustment : ($adjustmentType === 'Credit' ? -$adjustment : 0);
+            $totalBillable = ($currentAmount + $previousDues - $advanceAdjusted) + $adjEffect;
+            $netPayable = $bill->status === 'paid' ? 0.00 : max(0, $totalBillable - $paidAmount);
 
             $rows[] = [
                 'id'                  => $bill->id,
@@ -100,6 +107,8 @@ class BillController extends Controller
                 'previous_due_months' => $previousDueMonths,
                 'advance'             => $advanceAdjusted,
                 'advance_credit'      => $advanceCredit,
+                'adjustment'          => $adjustment,
+                'adjustment_type'     => $adjustmentType,
                 'net_total_payable'   => $netPayable,
                 'status'              => $bill->status,
                 'payments'            => $bill->payments,
@@ -174,22 +183,47 @@ class BillController extends Controller
                     }
                 }
 
-                $advanceAvail = (float) ($customer->advance_balance ?? 0);
-                $appliedAdvance = min($advanceAvail, $grossAmount);
-                $netAmount = max(0, $grossAmount - $appliedAdvance);
+                // Check previous dues: first from customer->dues, then from previous unpaid bills
+                $previousDues = (float) ($customer->dues ?? 0);
+                if ($previousDues <= 0) {
+                    $previousDues = (float) Bill::where('customer_id', $customer->id)
+                        ->where('bill_month', '<', $billMonth)
+                        ->whereIn('status', ['unpaid', 'partial'])
+                        ->get()
+                        ->sum(function ($pb) {
+                            $adj = (float) ($pb->adjustment ?? 0);
+                            $adjEffect = $pb->adjustment_type === 'Debit' ? $adj : ($pb->adjustment_type === 'Credit' ? -$adj : 0);
+                            return max(0, ((float) $pb->amount + $adjEffect) - (float) $pb->paid_amount);
+                        });
+                }
+
+                $advanceAvail = (float) ($customer->advance_balance ?? $customer->advance ?? 0);
+                $appliedAdvance = min($advanceAvail, $grossAmount + $previousDues);
+                $netBillable = ($grossAmount + $previousDues) - $appliedAdvance;
 
                 $bill = Bill::create([
-                    'customer_id'  => $customer->id,
-                    'bill_month'   => $billMonth,
-                    'amount'       => $netAmount,
-                    'advance'      => $appliedAdvance,
-                    'due_date'     => $dueDate,
-                    'status'       => $netAmount == 0 ? 'paid' : 'unpaid',
-                    'generated_at' => now(),
+                    'customer_id'     => $customer->id,
+                    'bill_month'      => $billMonth,
+                    'amount'          => $grossAmount,
+                    'previous_dues'   => $previousDues,
+                    'advance'         => $appliedAdvance,
+                    'adjustment'      => 0.00,
+                    'adjustment_type' => null,
+                    'due_date'        => $dueDate,
+                    'status'          => $netBillable <= 0 ? 'paid' : 'unpaid',
+                    'generated_at'    => now(),
                 ]);
+
+                // Reset customer standing dues since it has been incorporated into this bill
+                if ((float)($customer->dues ?? 0) > 0) {
+                    $customer->update(['dues' => 0.00]);
+                }
 
                 if ($appliedAdvance > 0) {
                     $customer->decrement('advance_balance', $appliedAdvance);
+                    if (\Illuminate\Support\Facades\Schema::hasColumn('customers', 'advance')) {
+                        $customer->decrement('advance', $appliedAdvance);
+                    }
                     $advanceAdjustedCount++;
                 }
 
@@ -211,11 +245,14 @@ class BillController extends Controller
     public function generateSingle(Request $request)
     {
         $request->validate([
-            'customer_id'   => 'required|exists:customers,id',
-            'bill_month'    => 'required|date_format:Y-m',
-            'due_date'      => 'required|date',
-            'amount'        => 'nullable|numeric|min:0',
-            'previous_dues' => 'nullable|numeric|min:0',
+            'customer_id'     => 'required|exists:customers,id',
+            'bill_month'      => 'required|date_format:Y-m',
+            'due_date'        => 'required|date',
+            'amount'          => 'nullable|numeric|min:0',
+            'previous_dues'   => 'nullable|numeric|min:0',
+            'advance'         => 'nullable|numeric|min:0',
+            'adjustment'      => 'nullable|numeric|min:0',
+            'adjustment_type' => 'nullable|in:Debit,Credit,debit,credit',
         ]);
 
         $customer = Customer::with('area')->findOrFail($request->customer_id);
@@ -253,28 +290,63 @@ class BillController extends Controller
             }
         }
 
-        $advanceAvail = (float) ($customer->advance_balance ?? 0);
-        $appliedAdvance = min($advanceAvail, $grossAmount);
-        $netAmount = max(0, $grossAmount - $appliedAdvance);
+        // Previous Dues
+        if ($request->has('previous_dues') && $request->previous_dues !== '' && $request->previous_dues !== null) {
+            $customPreviousDues = (float) $request->previous_dues;
+        } else {
+            $customPreviousDues = (float) ($customer->dues ?? 0);
+            if ($customPreviousDues <= 0) {
+                $customPreviousDues = (float) Bill::where('customer_id', $customer->id)
+                    ->where('bill_month', '<', $billMonth)
+                    ->whereIn('status', ['unpaid', 'partial'])
+                    ->get()
+                    ->sum(function ($pb) {
+                        $adj = (float) ($pb->adjustment ?? 0);
+                        $adjEffect = $pb->adjustment_type === 'Debit' ? $adj : ($pb->adjustment_type === 'Credit' ? -$adj : 0);
+                        return max(0, ((float) $pb->amount + $adjEffect) - (float) $pb->paid_amount);
+                    });
+            }
+        }
 
-        $customPreviousDues = $request->has('previous_dues') && $request->previous_dues !== '' && $request->previous_dues !== null
-            ? (float) $request->previous_dues
-            : null;
+        // Advance
+        if ($request->has('advance') && $request->advance !== '' && $request->advance !== null) {
+            $appliedAdvance = (float) $request->advance;
+        } else {
+            $advanceAvail = (float) ($customer->advance_balance ?? $customer->advance ?? 0);
+            $appliedAdvance = min($advanceAvail, $grossAmount + $customPreviousDues);
+        }
 
-        $bill = DB::transaction(function () use ($customer, $billMonth, $netAmount, $appliedAdvance, $dueDate, $customPreviousDues) {
+        // Adjustment
+        $adjustment = (float) ($request->adjustment ?? 0);
+        $adjustmentType = $request->filled('adjustment_type') ? ucfirst(strtolower($request->adjustment_type)) : null;
+        $adjEffect = $adjustmentType === 'Debit' ? $adjustment : ($adjustmentType === 'Credit' ? -$adjustment : 0);
+
+        $netBillable = ($grossAmount + $customPreviousDues - $appliedAdvance) + $adjEffect;
+        $status = $netBillable <= 0 ? 'paid' : 'unpaid';
+
+        $bill = DB::transaction(function () use ($customer, $billMonth, $grossAmount, $customPreviousDues, $appliedAdvance, $adjustment, $adjustmentType, $dueDate, $status) {
             $b = Bill::create([
-                'customer_id'   => $customer->id,
-                'bill_month'    => $billMonth,
-                'amount'        => $netAmount,
-                'previous_dues' => $customPreviousDues,
-                'advance'       => $appliedAdvance,
-                'due_date'      => $dueDate,
-                'status'        => $netAmount == 0 ? 'paid' : 'unpaid',
-                'generated_at'  => now(),
+                'customer_id'     => $customer->id,
+                'bill_month'      => $billMonth,
+                'amount'          => $grossAmount,
+                'previous_dues'   => $customPreviousDues,
+                'advance'         => $appliedAdvance,
+                'adjustment'      => $adjustment,
+                'adjustment_type' => $adjustmentType,
+                'due_date'        => $dueDate,
+                'status'          => $status,
+                'generated_at'    => now(),
             ]);
+
+            if ((float)($customer->dues ?? 0) > 0) {
+                $customer->update(['dues' => 0.00]);
+            }
 
             if ($appliedAdvance > 0) {
                 $customer->decrement('advance_balance', $appliedAdvance);
+                if (\Illuminate\Support\Facades\Schema::hasColumn('customers', 'advance')) {
+                    $customer->decrement('advance', $appliedAdvance);
+                }
             }
 
             \App\Http\Controllers\PaymentController::syncCustomerBillStatuses($customer->id);
@@ -342,10 +414,11 @@ class BillController extends Controller
             'Address',
             'Connection Type',
             'STB Serial',
-            'Current Month Bill (' . ($billMonth ?: 'All') . ')',
+            'Monthly Rent (' . ($billMonth ?: 'All') . ')',
             'Previous Dues (Tk)',
+            'Advance Adjusted (Tk)',
+            'Adjustment (Tk)',
             'Paid Amount (Tk)',
-            'Advance Credit (Tk)',
             'Total Payable Amount (Tk)',
             'Payment Status',
             'Collector Signature / Notes'
@@ -354,7 +427,7 @@ class BillController extends Controller
         $sheet->fromArray($headers, null, 'A1');
 
         // Header Styling: Emerald Background with Bold White Text
-        $headerRange = 'A1:O1';
+        $headerRange = 'A1:P1';
         $sheet->getStyle($headerRange)->getFont()->setBold(true)->setColor(new \PhpOffice\PhpSpreadsheet\Style\Color('FFFFFFFF'));
         $sheet->getStyle($headerRange)->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FF059669');
         $sheet->getStyle($headerRange)->getAlignment()->setVertical(Alignment::VERTICAL_CENTER);
@@ -374,18 +447,25 @@ class BillController extends Controller
                 ->orderBy('bill_month', 'asc')
                 ->get();
 
-            $calculatedPreviousDues = (float) $previousUnpaidBills->sum('due_amount');
+            $calculatedPreviousDues = (float) $previousUnpaidBills->sum(function ($pb) {
+                $adj = (float) ($pb->adjustment ?? 0);
+                $adjEffect = $pb->adjustment_type === 'Debit' ? $adj : ($pb->adjustment_type === 'Credit' ? -$adj : 0);
+                return max(0, ((float) $pb->amount + $adjEffect) - (float) $pb->paid_amount);
+            });
             $previousDues = $bill->previous_dues !== null ? (float) $bill->previous_dues : $calculatedPreviousDues;
 
             $currentBillAmount = (float) $bill->amount;
             $advanceAdjusted = (float) ($bill->advance ?? 0);
-            $advanceCredit = (float) ($customer->advance_balance ?? 0);
-            $totalAdvance = $advanceAdjusted + $advanceCredit;
             $paidAmount = (float) $bill->paid_amount;
+            $adjustment = (float) ($bill->adjustment ?? 0);
+            $adjustmentType = $bill->adjustment_type;
+            $adjEffect = $adjustmentType === 'Debit' ? $adjustment : ($adjustmentType === 'Credit' ? -$adjustment : 0);
 
-            $totalBillable = $currentBillAmount + $previousDues;
-            $totalDeductions = $paidAmount + $totalAdvance;
-            $totalPayable = max(0, $totalBillable - $totalDeductions);
+            $adjDisplay = $adjustment > 0 ? (($adjustmentType === 'Debit' ? '+' : '-') . number_format($adjustment, 2)) : '0.00';
+
+            // User formula: (Rent + dues - advance) +/- adjustment
+            $totalBillable = ($currentBillAmount + $previousDues - $advanceAdjusted) + $adjEffect;
+            $totalPayable = max(0, $totalBillable - $paidAmount);
 
             $rowData = [
                 $sl++,
@@ -398,8 +478,9 @@ class BillController extends Controller
                 $customer->stb_serial ?? '-',
                 $currentBillAmount,
                 $previousDues,
+                $advanceAdjusted,
+                $adjDisplay,
                 $paidAmount,
-                $totalAdvance,
                 $totalPayable,
                 strtoupper($bill->status),
                 ''
@@ -408,7 +489,7 @@ class BillController extends Controller
             $sheet->fromArray($rowData, null, 'A' . $rowIdx, true);
 
             // Format Currency cells
-            $sheet->getStyle('I' . $rowIdx . ':M' . $rowIdx)->getNumberFormat()->setFormatCode('#,##0.00');
+            $sheet->getStyle('I' . $rowIdx . ':N' . $rowIdx)->getNumberFormat()->setFormatCode('#,##0.00');
 
             $rowIdx++;
         }
@@ -427,21 +508,22 @@ class BillController extends Controller
                 '=SUM(I2:I' . ($rowIdx - 1) . ')',
                 '=SUM(J2:J' . ($rowIdx - 1) . ')',
                 '=SUM(K2:K' . ($rowIdx - 1) . ')',
-                '=SUM(L2:L' . ($rowIdx - 1) . ')',
+                '',
                 '=SUM(M2:M' . ($rowIdx - 1) . ')',
+                '=SUM(N2:N' . ($rowIdx - 1) . ')',
                 '',
                 ''
             ];
             $sheet->fromArray($summaryRow, null, 'A' . $rowIdx);
-            $summaryRange = 'A' . $rowIdx . ':O' . $rowIdx;
+            $summaryRange = 'A' . $rowIdx . ':P' . $rowIdx;
             $sheet->getStyle($summaryRange)->getFont()->setBold(true);
             $sheet->getStyle($summaryRange)->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FFF1F5F9');
-            $sheet->getStyle('I' . $rowIdx . ':M' . $rowIdx)->getNumberFormat()->setFormatCode('#,##0.00');
+            $sheet->getStyle('I' . $rowIdx . ':N' . $rowIdx)->getNumberFormat()->setFormatCode('#,##0.00');
             $sheet->getRowDimension($rowIdx)->setRowHeight(24);
         }
 
         // Auto-fit column widths
-        foreach (range('A', 'O') as $col) {
+        foreach (range('A', 'P') as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
         }
 
@@ -464,17 +546,25 @@ class BillController extends Controller
         }
 
         $request->validate([
-            'amount'        => 'required|numeric|min:0',
-            'previous_dues' => 'nullable|numeric|min:0',
-            'due_date'      => 'required|date',
-            'status'        => 'required|in:unpaid,partial,paid',
+            'amount'          => 'required|numeric|min:0',
+            'previous_dues'   => 'nullable|numeric|min:0',
+            'advance'         => 'nullable|numeric|min:0',
+            'adjustment'      => 'nullable|numeric|min:0',
+            'adjustment_type' => 'nullable|in:Debit,Credit,debit,credit',
+            'due_date'        => 'required|date',
+            'status'          => 'required|in:unpaid,partial,paid',
         ]);
 
+        $adjustmentType = $request->filled('adjustment_type') ? ucfirst(strtolower($request->adjustment_type)) : null;
+
         $bill->update([
-            'amount'        => $request->amount,
-            'previous_dues' => $request->has('previous_dues') && $request->previous_dues !== '' ? $request->previous_dues : 0,
-            'due_date'      => $request->due_date,
-            'status'        => $request->status,
+            'amount'          => $request->amount,
+            'previous_dues'   => $request->has('previous_dues') && $request->previous_dues !== '' ? $request->previous_dues : 0,
+            'advance'         => $request->has('advance') && $request->advance !== '' ? $request->advance : 0,
+            'adjustment'      => $request->has('adjustment') && $request->adjustment !== '' ? $request->adjustment : 0,
+            'adjustment_type' => $adjustmentType,
+            'due_date'        => $request->due_date,
+            'status'          => $request->status,
         ]);
 
         return response()->json([
